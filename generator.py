@@ -1,150 +1,138 @@
-import os
 import json
+import os
 import time
-import hashlib
 from tqdm import tqdm
-from typing import List
-from dotenv import load_dotenv
-import torch
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from sentence_transformers import SentenceTransformer, util
 
-load_dotenv()
+# =====================
+# CONFIGURATION
+# =====================
+API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL_NAME = "gemini-2.5-flash"
 
+TARGET_SAMPLES = 800
+BATCH_SIZE = 10
+OUTPUT_FILE = "synthetic_sales_leads.json"
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+SIMILARITY_THRESHOLD = 0.90
+SLEEP_BETWEEN_CALLS = 2
+
+LEAD_TYPES = ["enterprise", "startup", "smb", "individual", "unknown"]
+INTENTS = ["purchase", "demo", "inquiry", "support", "spam"]
+BUDGETS = ["low", "medium", "high", "unknown"]
+URGENCY = ["low", "medium", "high"]
+
+# =====================
+# INIT
+# =====================
+genai.configure(api_key=API_KEY)
+model = genai.GenerativeModel(MODEL_NAME)
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-GENERATION_PROMPT = """
-You are generating realistic inbound B2B sales inquiries for a SaaS company.
-
-Rules:
-- Output EXACTLY 10 distinct sales messages.
-- Each message should be 1–5 sentences.
-- Messages must sound human-written, informal or semi-formal.
-- Include typos, incomplete sentences, or casual phrasing occasionally.
-- Vary:
-  - company size (startup, SMB, enterprise, individual)
-  - intent (demo, purchase, inquiry, support, spam)
-  - urgency (low, medium, high)
-  - clarity of budget
-- Some messages should be ambiguous or unclear.
-- DO NOT number the messages.
-- DO NOT include explanations.
-
-Return as a JSON array of strings.
-"""
-
-def normalize(text: str) -> str:
-    return " ".join(text.lower().split())
-
-
-class DuplicateChecker:
-    def __init__(self, threshold: float = 0.90):
-        self.threshold = threshold
-        self.texts = []
-        self.embeddings = []
-
-    def is_duplicate(self, text: str) -> bool:
-        if not self.texts:
-            return False
-
-        emb = embedder.encode(text, convert_to_tensor=True)
-        # Stack embeddings list into a tensor
-        embeddings_tensor = torch.stack(self.embeddings)
-        scores = util.cos_sim(emb, embeddings_tensor)
-        return scores.max().item() >= self.threshold
-
-    def add(self, text: str):
-        emb = embedder.encode(text, convert_to_tensor=True)
-        self.texts.append(text)
-        self.embeddings.append(emb)
-
-
-def generate_batch(model_name: str) -> List[str]:
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text=GENERATION_PROMPT),
-                    ],
-                ),
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            )
-        )
-        
-        raw = response.text
-        messages = json.loads(raw)
-        
-        if isinstance(messages, list):
-             # Ensure we return strings
-             return [str(m).strip() for m in messages]
-        return []
-    except Exception as e:
-        print(f"Error generating batch with {model_name}: {e}")
-        return []
-
-
-def generate_dataset(
-    output_file="raw_sales_messages.json",
-    sleep_time=8.0  # Enforce ~7.5 calls/min limit
-):
-    checker = DuplicateChecker()
+# =====================
+# LOAD EXISTING DATA
+# =====================
+if os.path.exists(OUTPUT_FILE):
+    with open(OUTPUT_FILE, "r") as f:
+        dataset = json.load(f)
+else:
     dataset = []
 
-    # Resume if file exists
-    if os.path.exists(output_file):
-        with open(output_file, "r") as f:
-            dataset = json.load(f)
-        for item in dataset:
-            checker.add(item)
-    
-    # Models to rotate through
-    models = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']
-    batches_per_model = 19
-    
-    total_expected = len(dataset) + (len(models) * batches_per_model * 10) # Approx
-    pbar = tqdm(total=total_expected, initial=len(dataset))
+existing_texts = [item["input"] for item in dataset]
+existing_embeddings = embedder.encode(existing_texts, convert_to_tensor=True) if existing_texts else None
 
-    for model in models:
-        print(f"\nSwitching to model: {model}")
-        for i in range(batches_per_model):
-            batch = generate_batch(model)
-            
-            # If batch is empty due to error, we should still sleep to avoid hammering
-            if not batch:
-                 time.sleep(sleep_time)
-                 continue
-
-            for msg in batch:
-                norm = normalize(msg)
-                if checker.is_duplicate(norm):
-                    continue
-
-                checker.add(norm)
-                dataset.append(msg)
-                pbar.update(1)
-
-            # Build incremental save
-            with open(output_file, "w") as f:
-                json.dump(dataset, f, indent=2)
-            
-            time.sleep(sleep_time)
-
-    pbar.close()
-    print(f"Saved {len(dataset)} samples to {output_file}")
+# =====================
+# VALIDATION FUNCTIONS
+# =====================
+def validate_schema(item):
+    try:
+        o = item["output"]
+        return (
+            o["lead_type"] in LEAD_TYPES and
+            o["intent"] in INTENTS and
+            o["budget_range"] in BUDGETS and
+            o["urgency"] in URGENCY and
+            isinstance(o["recommended_action"], str)
+        )
+    except Exception:
+        return False
 
 
-if __name__ == "__main__":
-    generate_dataset(
-        output_file="raw_sales_messages.json"
-    )
+def is_similar(text, existing_embeds):
+    if existing_embeds is None:
+        return False
+    emb = embedder.encode(text, convert_to_tensor=True)
+    scores = util.cos_sim(emb, existing_embeds)
+    return scores.max().item() > SIMILARITY_THRESHOLD
 
 
+# =====================
+# PROMPT TEMPLATE
+# =====================
+PROMPT = """
+Generate 10 realistic and diverse inbound B2B sales messages.
+
+Requirements:
+- Each item must be different in tone, company type, urgency, and intent
+- Avoid repeating phrasing or structure
+- Include ambiguity, informal language, or typos where appropriate
+- Mix strong buying signals, weak signals, support requests, and spam
+
+Output format:
+A valid JSON array of objects, where each object has:
+- "input": string
+- "output": {
+    "lead_type": one of [enterprise, startup, smb, individual, unknown],
+    "intent": one of [purchase, demo, inquiry, support, spam],
+    "budget_range": one of [low, medium, high, unknown],
+    "urgency": one of [low, medium, high],
+    "recommended_action": string
+}
+
+Output ONLY the JSON array. No explanations.
+"""
+
+# =====================
+# MAIN GENERATION LOOP
+# =====================
+with tqdm(total=TARGET_SAMPLES, initial=len(dataset)) as pbar:
+    while len(dataset) < TARGET_SAMPLES:
+        response = model.generate_content(PROMPT)
+        try:
+            batch = json.loads(response.text)
+        except json.JSONDecodeError:
+            continue
+
+        accepted = []
+
+        for item in batch:
+            if not validate_schema(item):
+                continue
+            if is_similar(item["input"], existing_embeddings):
+                continue
+            accepted.append(item)
+
+        if not accepted:
+            continue
+
+        dataset.extend(accepted)
+
+        # Update embeddings
+        new_texts = [x["input"] for x in accepted]
+        new_embeds = embedder.encode(new_texts, convert_to_tensor=True)
+
+        if existing_embeddings is None:
+            existing_embeddings = new_embeds
+        else:
+            existing_embeddings = util.cat((existing_embeddings, new_embeds), dim=0)
+
+        # Save incrementally
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(dataset, f, indent=2)
+
+        pbar.update(len(accepted))
+        time.sleep(SLEEP_BETWEEN_CALLS)
+
+print(f"Dataset generation complete: {len(dataset)} samples saved.")
